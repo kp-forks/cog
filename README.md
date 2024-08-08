@@ -32,7 +32,7 @@ build:
     - "libglib2.0-0"
   python_version: "3.12"
   python_packages:
-    - "torch==2.2.1"
+    - "torch==2.3"
 predict: "predict.py:Predictor"
 ```
 
@@ -149,6 +149,12 @@ Alternatively, you can build Cog from source and install it with these commands:
 ```console
 make
 sudo make install
+```
+
+Or if you are on docker:
+
+```
+RUN sh -c "INSTALL_DIR=\"/usr/local/bin\" SUDO=\"\" $(curl -fsSL https://cog.run/install.sh)"
 ```
 
 ## Upgrade

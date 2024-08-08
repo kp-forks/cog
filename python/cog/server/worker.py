@@ -128,9 +128,8 @@ class Worker:
         if done:
             if done.error and raise_on_error:
                 raise FatalWorkerException(raise_on_error + ": " + done.error_detail)
-            else:
-                self._state = WorkerState.READY
-                self._allow_cancel = False
+            self._state = WorkerState.READY
+            self._allow_cancel = False
 
         # If we dropped off the end off the end of the loop, check if it's
         # because the child process died.
@@ -139,6 +138,19 @@ class Worker:
             raise FatalWorkerException(
                 f"Prediction failed for an unknown reason. It might have run out of memory? (exitcode {exitcode})"
             )
+
+
+class LockedConn:
+    def __init__(self, conn: Connection) -> None:
+        self.conn = conn
+        self._lock = _spawn.Lock()
+
+    def send(self, obj: Any) -> None:
+        with self._lock:
+            self.conn.send(obj)
+
+    def recv(self) -> Any:
+        return self.conn.recv()
 
 
 class _ChildWorker(_spawn.Process):  # type: ignore
@@ -150,10 +162,10 @@ class _ChildWorker(_spawn.Process):  # type: ignore
     ) -> None:
         self._predictor_ref = predictor_ref
         self._predictor: Optional[BasePredictor] = None
-        self._events = events
+        self._events = LockedConn(events)
         self._tee_output = tee_output
+        self._stream_redirector: Optional[StreamRedirector] = None
         self._cancelable = False
-        self._events_lock = _spawn.Lock()
 
         super().__init__()
 
@@ -179,7 +191,8 @@ class _ChildWorker(_spawn.Process):  # type: ignore
         self._setup()
         self._loop()
 
-        self._stream_redirector.shutdown()
+        if self._stream_redirector:
+            self._stream_redirector.shutdown()
 
     def _setup(self) -> None:
         done = Done()
@@ -188,7 +201,7 @@ class _ChildWorker(_spawn.Process):  # type: ignore
             # Could be a function or a class
             if hasattr(self._predictor, "setup"):
                 run_setup(self._predictor)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             traceback.print_exc()
             done.error = True
             done.error_detail = str(e)
@@ -200,16 +213,16 @@ class _ChildWorker(_spawn.Process):  # type: ignore
             done.error_detail = str(e)
             raise
         finally:
-            self._stream_redirector.drain()
-            with self._events_lock:
-                self._events.send(done)
+            if self._stream_redirector:
+                self._stream_redirector.drain()
+            self._events.send(done)
 
     def _loop(self) -> None:
         while True:
             ev = self._events.recv()
             if isinstance(ev, Shutdown):
                 break
-            elif isinstance(ev, PredictionInput):
+            if isinstance(ev, PredictionInput):
                 self._predict(ev.payload)
             else:
                 print(f"Got unexpected event: {ev}", file=sys.stderr)
@@ -223,31 +236,30 @@ class _ChildWorker(_spawn.Process):  # type: ignore
             result = predict(**payload)
 
             if result:
-                with self._events_lock:
-                    if isinstance(result, types.GeneratorType):
-                        self._events.send(PredictionOutputType(multi=True))
-                        for r in result:
-                            self._events.send(
-                                PredictionOutput(payload=make_encodeable(r))
-                            )
-                    else:
-                        self._events.send(PredictionOutputType(multi=False))
-                        self._events.send(
-                            PredictionOutput(payload=make_encodeable(result))
-                        )
+                if isinstance(result, types.GeneratorType):
+                    self._events.send(PredictionOutputType(multi=True))
+                    for r in result:
+                        self._events.send(PredictionOutput(payload=make_encodeable(r)))
+                else:
+                    self._events.send(PredictionOutputType(multi=False))
+                    self._events.send(PredictionOutput(payload=make_encodeable(result)))
         except CancelationException:
             done.canceled = True
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             traceback.print_exc()
             done.error = True
             done.error_detail = str(e)
         finally:
             self._cancelable = False
-        self._stream_redirector.drain()
-        with self._events_lock:
+            if self._stream_redirector:
+                self._stream_redirector.drain()
             self._events.send(done)
 
-    def _signal_handler(self, signum: int, frame: Optional[types.FrameType]) -> None:
+    def _signal_handler(
+        self,
+        signum: int,
+        frame: Optional[types.FrameType],  # pylint: disable=unused-argument
+    ) -> None:
         if signum == signal.SIGUSR1 and self._cancelable:
             raise CancelationException()
 
@@ -257,5 +269,4 @@ class _ChildWorker(_spawn.Process):  # type: ignore
         if self._tee_output:
             original_stream.write(data)
             original_stream.flush()
-        with self._events_lock:
-            self._events.send(Log(data, source=stream_name))
+        self._events.send(Log(data, source=stream_name))
